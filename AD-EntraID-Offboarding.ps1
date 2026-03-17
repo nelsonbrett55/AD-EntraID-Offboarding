@@ -1,706 +1,891 @@
-﻿#Import-Module ExchangeOnlineManagement
-#Import-Module Microsoft.Graph
+# ==========================================
+# Enterprise Employee Offboarding Console
+# ==========================================
+
+Import-Module ActiveDirectory -ErrorAction Stop
+#Import-Module Microsoft.Graph -ErrorAction Stop
+Import-Module ExchangeOnlineManagement -ErrorAction Stop
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.DirectoryServices.AccountManagement
-Add-Type -AssemblyName PresentationFramework
 
-$FormerEmployeeOU = "OU=Former Employees,OU=UserAccounts,DC=FABRIKAM,DC=COM"
+$FormerEmployeeOU = "OU=Former Employees,DC=CONTOSO,DC=LOCAL"
 
-function Disable-AdAccount {
-    if ($global:AdUser) {
-        $global:AdUser | Disable-ADAccount
-        Write-Host -F Cyan "$($global:ADName)" -NoNewline
-        Write-Host -F White "'s account is now " -NoNewline
-        Write-Host -F Red "Disabled"
-    } else {
-        write-Host -F Red "Disable-AdAccount: There's no AD User"
+function Setup-AutoReply {
+
+    if (-not $script:Context.Connected) {
+        Add-Log "Auto Reply" "ERROR" "Not connected to Microsoft 365"
+        return
+    }
+
+    if (-not $script:Context.ADUser) {
+        Add-Log "Auto Reply" "ERROR" "No user loaded"
+        return
+    }
+
+    $user = $script:Context.ADUser
+    $manager = $script:Context.ADManager
+
+    $dn = $user.DistinguishedName
+
+    # -----------------------------------
+    # Determine Location and Phone by OU
+    # -----------------------------------
+
+    $LocationPhone = "123-456-0001" #default
+    $LocationName  = "Location1"
+
+    if ($dn -like "*OU=Location2*") {
+        $LocationPhone = "123-456-0002"
+        $LocationName  = "Location2"
+    }
+    elseif ($dn -like "*OU=Location3*") {
+        $LocationPhone = "123-456-0003"
+        $LocationName  = "Location3"
+    }
+
+    $firstName = $user.GivenName
+    $managerEmail = if ($manager) { $manager.UserPrincipalName }
+
+    # -----------------------------------
+    # Default Message Template
+    # -----------------------------------
+
+    $defaultMessage = @"
+Thank you for your email.
+
+$firstName is no longer with the company. Could you please call our office at $LocationPhone or email their manager at $managerEmail?
+
+Thanks and have a great day!
+"@
+
+    # -----------------------------------
+    # Popup Form
+    # -----------------------------------
+
+    $formAR = New-Object System.Windows.Forms.Form
+    $formAR.Text = "Set Auto Reply - $($user.DisplayName)"
+    $formAR.Size = "600,400"
+    $formAR.StartPosition = "CenterParent"
+
+    $txtBox = New-Object System.Windows.Forms.RichTextBox
+    $txtBox.Dock = "Fill"
+    $txtBox.Text = $defaultMessage
+    $formAR.Controls.Add($txtBox)
+
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Dock = "Bottom"
+    $panel.Height = 50
+    $formAR.Controls.Add($panel)
+
+    $btnOK = New-Object System.Windows.Forms.Button
+    $btnOK.Text = "Apply"
+    $btnOK.Width = 100
+    $btnOK.Height = 30
+    $btnOK.Left = 350
+    $btnOK.Top = 10
+    $panel.Controls.Add($btnOK)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancel"
+    $btnCancel.Width = 100
+    $btnCancel.Height = 30
+    $btnCancel.Left = 460
+    $btnCancel.Top = 10
+    $panel.Controls.Add($btnCancel)
+
+    $btnCancel.Add_Click({ $formAR.Close() })
+
+    $btnOK.Add_Click({
+
+        try {
+            Set-MailboxAutoReplyConfiguration `
+                -Identity $user.UserPrincipalName `
+                -AutoReplyState Enabled `
+                -InternalMessage $txtBox.Text `
+                -ExternalMessage $txtBox.Text `
+                -ExternalAudience All
+
+            Add-Log "Auto Reply" "SUCCESS" "Enabled for $($user.DisplayName) $LocationName"
+        }
+        catch {
+            Add-Log "Auto Reply" "ERROR" $_
+        }
+
+        $formAR.Close()
+    })
+
+    $formAR.ShowDialog()
+}
+# ==========================================
+# Context Engine
+# ==========================================
+
+$script:Context = [PSCustomObject]@{
+    ADUser    = $null
+    ADManager = $null
+    MGUser    = $null
+    MGGroups  = @()
+    Licenses  = @()
+    EXMailbox = $null
+    Connected = $false
+    Log       = @()
+}
+
+# ==========================================
+# Logging System
+# ==========================================
+
+function Add-Log {
+    param($Action,$Status,$Details)
+
+    $entry = [PSCustomObject]@{
+        Time = Get-Date
+        Action = $Action
+        Status = $Status
+        Details = $Details
+    }
+
+    $script:Context.Log += $entry
+
+    $timestamp = $entry.Time.ToString("HH:mm:ss")
+    $line = "[$timestamp] [$Status] $Action — $Details`r`n"
+
+    # Choose color based on status
+    switch ($Status.ToUpper()) {
+        "SUCCESS" { $color = [System.Drawing.Color]::LimeGreen }
+        "WARNING" { $color = [System.Drawing.Color]::Orange }
+        "ERROR"   { $color = [System.Drawing.Color]::Red }
+        "INFO"    { $color = [System.Drawing.Color]::LightGray }
+        default   { $color = [System.Drawing.Color]::White }
+    }
+
+    # Append colored text
+    $LogBox.SelectionStart = $LogBox.TextLength
+    $LogBox.SelectionLength = 0
+    $LogBox.SelectionColor = $color
+    $LogBox.AppendText($line)
+    $LogBox.SelectionColor = $LogBox.ForeColor
+    $LogBox.ScrollToCaret()
+}
+
+function Invoke-WithRetry {
+    param([scriptblock]$Script,[int]$Retries=3)
+
+    for ($i=1;$i -le $Retries;$i++) {
+        try { return & $Script }
+        catch {
+            if ($i -eq $Retries) { throw }
+            Start-Sleep 2
+        }
     }
 }
-function Update-DisplayName {
-    if ($global:AdUser) {
-        $newDisplayName = "$($global:AdUser.DisplayName) (Former Employee)"
-        Set-ADUser -Identity $global:ADSam -DisplayName $newDisplayName
-        Write-Host -F Cyan "$($global:ADName)" -NoNewLine
-        Write-Host "'s DisplayName is now " -NoNewline
-        Write-Host -F Red $newDisplayName
-    } else {
-        write-Host -F Red "Update-DisplayName: There's no AD User"
+
+# ==========================================
+# Cloud Connection
+# ==========================================
+
+function Connect-Cloud {
+    try {
+        Add-Log "Cloud Connect" "INFO" "Connecting to Microsoft 365..."
+        Connect-MgGraph
+        Connect-ExchangeOnline -DisableWAM
+        $script:Context.Connected = $true
+        Add-Log "Cloud Connect" "SUCCESS" "Connected to Microsoft 365"
+        $CheckMailGroupsBtn.Enabled = $true
+        $ConnectBtn.Enabled = $false
+        $ExportBtn.Enabled = $true
+        $btnVerify.Enabled = $true
     }
+    catch {
+        Add-Log "Cloud Connect" "FAILED" $_
+        $CheckMailGroupsBtn.Enabled = $false
+        $ConnectBtn.Enabled = $true
+        $RunAllBtn.Enabled = $false
+        $ExportBtn.Enabled = $false
+        $btnVerify.Enabled = $false
+    }
+    Refresh-UI
 }
-function Remove-FromSecurityGroups {
-    if ($global:AdUser) {
-        $AllGroups = Get-ADGroup -Filter *
-        foreach ($group in $AllGroups) {
-            $members = Get-ADGroupMember -Identity $group
-            if ($members | Where-Object { $_.SamAccountName -eq $global:ADSam }) {
-                if ($group.Name -ne "Domain Users"){
-                    Remove-ADGroupMember -Identity $group -Members $global:ADSam -Confirm:$false
-                    Write-Host -F Cyan "$($global:ADName) was " -NoNewline
-                    Write-Host -F Red "Red" -noNewLine
-                    Write-Host -F White " from " -NoNewline
-                    Write-Host -F Cyan $group.Name
+
+# ==========================================
+# Checks for former employees in mail groups
+# ==========================================
+function Check-MailGroups {
+    $CheckMailGroupsBtn.Enabled = $false
+    
+    if (-not $script:Context.Connected) {
+        Add-Log "Check Mail Groups" "ERROR" "Not connected to Microsoft 365"
+        return
+    }
+
+    Add-Log "Check Mail Groups" "INFO" "Scanning all mail-enabled groups (Distribution + M365 + Teams)..."
+
+    # Get former employees from OU
+    $formerUsers = Get-ADUser -Filter * `
+        -SearchBase $FormerEmployeeOU `
+        -Properties DisplayName,UserPrincipalName
+
+    if ($formerUsers.Count -eq 0) {
+        Add-Log "Check Mail Groups" "INFO" "No users found in Former Employees OU"
+        return
+    }
+
+    # Build lookup table
+    $formerLookup = @{}
+    foreach ($u in $formerUsers) {
+        if ($u.UserPrincipalName) {
+            $formerLookup[$u.UserPrincipalName.ToLower()] = $u.DisplayName
+        }
+    }
+
+    $groupHits = @{}
+
+    # ======================================================
+    # 1 Distribution + Mail-Enabled Security Groups
+    # ======================================================
+
+    $distGroups = Get-DistributionGroup -ResultSize Unlimited
+
+    foreach ($group in $distGroups) {
+
+        try {
+            $members = Get-DistributionGroupMember `
+                -Identity $group.Identity `
+                -ResultSize Unlimited | Select PrimarySmtpAddress
+
+            foreach ($member in $members) {
+
+                $smtp = $member.PrimarySmtpAddress.ToString().ToLower()
+
+                if ($formerLookup.ContainsKey($smtp)) {
+
+                    if (-not $groupHits.ContainsKey($group.DisplayName)) {
+                        $groupHits[$group.DisplayName] = 0
+                    }
+
+                    $groupHits[$group.DisplayName]++
                 }
             }
         }
-    } else {
-        write-Host -F Red "Remove-FromSecurityGroups: There's no AD User"
-    }
-}
-function Clear-Manager {
-    if ($global:AdUser) {
-        Set-ADUser -Identity $global:ADSam -Manager $null
-        Write-Host -F Cyan "$($global:ADName)" -NoNewline
-        Write-Host -F White "'s previous manager was " -NoNewline
-        Write-Host -F Green "$($global:ADManager.DisplayName)" -NoNewline
-        Write-Host -F White " but is now " -nonewLine
-        write-Host -F Red "NULL" -NoNewline
-    } else {
-        write-Host -F Red "Clear-Manager: There's no AD User"
-    }
-}
-function Move-AdUserToOU {
-    $SourceOU = ($global:AdUser.DistinguishedName -replace "CN=.*?,", "" -replace "OU=", "\" -replace ",DC=", "\" -replace "DKB\\LOCAL", "DKB.LOCAL" -replace ",\\", "\")
-    $components = $SourceOU.TrimStart('\').Split('\') | ForEach-Object { $_.Trim() }
-    [array]::Reverse($components)
-    $SourceOU = $components -join "\"
-
-    $targetOU = $global:FormerEmployeeOU
-    Move-ADObject -Identity $global:AdUser.DistinguishedName -TargetPath $targetOU
-    
-    $targetOU = ($targetOU -replace "CN=.*?,", "" -replace "OU=", "\" -replace ",DC=", "\" -replace "DKB\\LOCAL", "DKB.LOCAL" -replace ",\\", "\")
-    $components = $targetOU.TrimStart('\').Split('\') | ForEach-Object { $_.Trim() }
-    [array]::Reverse($components)
-    $targetOU = $components -join "\"
-    Write-Host -F Cyan "$($global:ADName)" -NoNewline
-    Write-Host -F White " was " -NoNewline
-    Write-Host -F Red "moved" -NoNewline
-    Write-Host -F White " from " -NoNewline
-    Write-Host -F Cyan $SourceOU -NoNewline
-    Write-Host " to " -NoNewline
-    Write-Host -F Red $targetOU
-}
-function Revoke-Office365Sessions {
-    $null = Revoke-MgUserSignInSession -UserId $global:ADUser.UserPrincipalName
-    Write-Host -F Cyan "$($global:ADName)" -NoNewline
-    Write-Host -F White "'s Office 365 sessions were " -NoNewline
-    Write-Host -F Red "Revoked"
-}
-function Remove-FromExchangeGroups {
-    $groupMemberships = $MGGroups
-
-    foreach ($groupMembership in $groupMemberships) {
-        if ($groupMembership.AdditionalProperties.mailEnabled) {
-            # ===================================================================
-            # You'll have to log into Microsoft Exchange Manually and Remove them
-            # ===================================================================
-
-            #Remove-MgGroupM -GroupId $groupMembership.Id -UserId $global:MGUser.Id
-            Write-Host -F Cyan "$($global:ADName)" -NoNewline
-            Write-Host -F Red " could NOT be removed" -NoNewline
-            Write-Host -F White " from " -NoNewline
-            Write-Host -F Cyan $groupMembership.AdditionalProperties.displayName -NoNewline
-            Write-Host -F White " because Microsoft doesn't allow changes to MailEnabled Groups through Graph"
-        } else {
-            Remove-MgGroupMemberByRef -GroupId $groupMembership.Id -DirectoryObjectId $global:MGUser.Id
-            Write-Host -F Cyan "$($global:ADName) was " -NoNewline
-            Write-Host -F Red "Removed" -noNewLine
-            Write-Host -F White " from " -NoNewline
-            Write-Host -F Cyan $groupMembership.AdditionalProperties.displayName
+        catch {
+            Add-Log "Check Mail Groups" "WARNING" "Failed checking DG $($group.DisplayName)"
         }
     }
+
+    # ======================================================
+    # 2 Microsoft 365 / Public / Teams Groups
+    # ======================================================
+
+    $unifiedGroups = Get-UnifiedGroup -ResultSize Unlimited
+
+    foreach ($group in $unifiedGroups) {
+
+        try {
+            $members = Get-UnifiedGroupLinks `
+                -Identity $group.Identity `
+                -LinkType Members `
+                -ResultSize Unlimited
+
+            foreach ($member in $members) {
+
+                $smtp = $member.PrimarySmtpAddress.ToString().ToLower()
+
+                if ($formerLookup.ContainsKey($smtp)) {
+
+                    if (-not $groupHits.ContainsKey($group.DisplayName)) {
+                        $groupHits[$group.DisplayName] = 0
+                    }
+
+                    $groupHits[$group.DisplayName]++
+                }
+            }
+        }
+        catch {
+            Add-Log "Check Mail Groups" "WARNING" "Failed checking M365 group $($group.DisplayName)"
+        }
+    }
+
+    # ======================================================
+    # Final Output
+    # ======================================================
+
+    if ($groupHits.Count -eq 0) {
+        Add-Log "Check Mail Groups" "SUCCESS" "No mail-enabled groups contain former employees"
+        return
+    }
+
+    Add-Log "Check Mail Groups" "WARNING" "Mail-enabled groups containing former employees:"
+
+    foreach ($g in $groupHits.GetEnumerator() | Sort-Object Name) {
+
+        $count = $g.Value
+        $label = if ($count -eq 1) { "former employee" } else { "former employees" }
+
+        Add-Log "Mail Group" "WARNING" "$($g.Name) ($count $label)"
+    }
+
+    $CheckMailGroupsBtn.Enabled = $true
 }
-function Convert-MailboxToShared {
-    Set-Mailbox -Identity $global:ADUser.UserPrincipalName -Type Shared
-    Write-Host -F Cyan "$($global:ADName)" -NoNewline
-    Write-Host -F White "'s Mailbox was changed to a " -NoNewline
-    Write-Host -F Red "Shared Mailbox"
+
+# ==========================================
+# Load User
+# ==========================================
+
+function Load-User {
+    param($Sam)
+
+    try {
+        $ctx = $script:Context
+
+        $ctx.ADUser = Get-ADUser $Sam -Properties *
+        $ctx.ADManager = if ($ctx.ADUser.Manager) {
+            Get-ADUser $ctx.ADUser.Manager -Properties *
+        }
+
+        if ($ctx.Connected) {
+            $upn = $ctx.ADUser.UserPrincipalName
+            $ctx.MGUser = Invoke-WithRetry { Get-MgUser -UserId $upn }
+            $ctx.MGGroups = Invoke-WithRetry { Get-MgUserMemberOf -UserId $upn }
+            $ctx.Licenses = Invoke-WithRetry { Get-MgUserLicenseDetail -UserId $upn }
+            $ctx.EXMailbox = Get-Mailbox -Identity $upn -ErrorAction SilentlyContinue
+        }
+
+        Add-Log "Load User" "SUCCESS" $ctx.ADUser.DisplayName
+        $RunAllBtn.Enabled = $true
+        $AutoReplyBtn.Enabled = $true
+    }
+    catch {
+        Add-Log "Load User" "FAILED" $_
+        $RunAllBtn.Enabled = $false
+        $AutoReplyBtn.Enabled = $false
+    }
+
+    Refresh-UI
 }
-function Remove-MicrosoftLicenses {
-    $licenses = $MGlicenses
-    foreach ($license in $licenses) {
-        $NULL = Set-MgUserLicense -UserId $global:ADUser.UserPrincipalName -RemoveLicenses @($license.SkuId) -AddLicenses @{}
-        Write-Host -F Cyan "$($global:ADName)'s " -NoNewline
-        Write-Host -F Cyan $license.SkuPartNumber -NoNewline
-        Write-Host -F White " was " -NoNewline
-        Write-Host -F Red "removed"
+
+# ==========================================
+# Offboarding Actions
+# ==========================================
+# === Verify OU function ===
+function Verify-FormerOU {
+
+    $RunAllBtn.Enabled = $false
+
+    $users = Get-ADUser -Filter * -SearchBase $FormerEmployeeOU -Properties *
+
+    if ($users.Count -eq 0) {
+        Add-Log "Verify Former OU" "INFO" "No users found in Former Employees OU"
+        return
+    }
+
+    $total = $users.Count
+    $current = 0
+
+    Add-Log "Verify Former OU" "INFO" "Checking $total users in Former Employees OU"
+
+    foreach ($u in $users) {
+
+        $current++
+        $upn = $u.UserPrincipalName
+        $issues = @()
+
+        # -----------------------------
+        # AD Groups
+        # -----------------------------
+        $adGroups = Get-ADPrincipalGroupMembership $u |
+            Where-Object { $_.Name -ne "Domain Users" }
+
+        if ($adGroups.Count -gt 0) {
+            $issues += "AD Groups: $($adGroups.Name -join ', ')"
+        }
+
+        # -----------------------------
+        # Licenses (Graph)
+        # -----------------------------
+        try {
+            if ($script:Context.Connected -and $upn) {
+                $mgUser = Get-MgUser -UserId $upn -Property AssignedLicenses
+                if ($mgUser.AssignedLicenses.Count -gt 0) {
+                    $issues += "Licenses still assigned"
+                }
+            }
+        } catch {}
+
+        # -----------------------------
+        # Cloud Groups
+        # -----------------------------
+        try {
+            if ($script:Context.Connected -and $upn) {
+                $mgGroups = Get-MgUserMemberOf -UserId $upn -All |
+                    Where-Object { $_.'@odata.type' -eq "#microsoft.graph.group" }
+
+                if ($mgGroups.Count -gt 0) {
+                    $issues += "Cloud Groups: $($mgGroups.AdditionalProperties.displayName -join ', ')"
+                }
+            }
+        } catch {}
+
+        # -----------------------------
+        # Display Name Check
+        # -----------------------------
+        if ($u.DisplayName -notlike "*Former Employee*") {
+            $issues += "Display name not marked Former Employee"
+        }
+
+        # -----------------------------
+        # Output
+        # -----------------------------
+        $displayName = "$($u.GivenName) $($u.Surname)"
+
+        if ($issues.Count -eq 0) {
+
+            Add-Log "$current/$total" "SUCCESS" `
+                "$displayName has no remaining AD groups, licenses, or M365 groups."
+
+        } else {
+
+            Add-Log "$current/$total" "WARNING" `
+                "$displayName still has: $($issues -join '; ')"
+        }
+    }
+
+    Add-Log "Verify Former OU" "INFO" "Audit complete."
+
+    $RunAllBtn.Enabled = $true
+}
+function Disable-User {
+    $u = $script:Context.ADUser
+    if ($u.Enabled) {
+        Disable-ADAccount $u
+        Add-Log "Disable AD" "SUCCESS" $u.SamAccountName
     }
 }
-function Delegate-MailboxAccess {
-    $NULL = Add-MailboxPermission -Identity $global:ADUser.UserPrincipalName -User $global:ADManager.UserPrincipalName -AccessRights FullAccess -AutoMapping $true
-    Write-Host -F Green "$($global:ADManager.DisplayName)" -NoNewline
-    Write-Host -F White " now has Delegate rights on " -NoNewline
-    Write-Host -F Cyan "$($global:ADName)" -NoNewline
-    Write-Host -F White "'s Mailbox"
+
+function Rename-User {
+    $u = $script:Context.ADUser
+    if ($u.DisplayName -notlike "*Former Employee*") {
+        $new = "$($u.DisplayName) (Former Employee)"
+        Set-ADUser $u -DisplayName $new
+        Add-Log "Rename User" "SUCCESS" $new
+    }
 }
-function Grant-OneDriveAccess {
-    $Body = @{
-        roles = @("owner")
-        grantedTo = @{
-            user = @{
-                email = $global:ADUser.UserP
+
+function Remove-Groups {
+    $u = $script:Context.ADUser
+    $upn = $u.UserPrincipalName
+
+    # 1 On-prem AD groups (not synced, not Domain Users)
+    $adGroups = Get-ADPrincipalGroupMembership $u |
+        Where-Object { $_.Name -ne "Domain Users" -and -not $_.IsCriticalSystemObject -and -not $_.DistinguishedName -like "*CN=Sync*" }
+
+    foreach ($g in $adGroups) {
+        try {
+            Remove-ADGroupMember -Identity $g -Members $u -Confirm:$false -ErrorAction Stop
+            Add-Log "Remove AD Group" "SUCCESS" "Removed $($u.SamAccountName) from $($g.Name)"
+        }
+        catch {
+            Add-Log "Remove AD Group" "ERROR" "Failed to remove $($u.SamAccountName) from $($g.Name): $_"
+        }
+    }
+
+    # 2 Azure / mail-enabled / synced groups
+    if ($script:Context.Connected) {
+        $mgGroups = Get-MgUserMemberOf -UserId $upn | Where-Object { $_.'@odata.type' -eq "#microsoft.graph.group" }
+
+        foreach ($g in $mgGroups) {
+            try {
+                # Skip read-only synced groups
+                if ($g.SecurityEnabled -and -not $g.GroupTypes.Contains("Unified")) {
+                    Invoke-MgGraphRequest -Method DELETE -Uri "https://graph.microsoft.com/v1.0/groups/$($g.Id)/members/$($u.Id)/\$ref"
+                    Add-Log "Remove Cloud Group" "SUCCESS" "Removed $($u.DisplayName) from $($g.DisplayName)"
+                }
+                else {
+                    Add-Log "Remove Cloud Group" "INFO" "Skipped synced/mail group $($g.DisplayName)"
+                }
+            }
+            catch {
+                Add-Log "Remove Cloud Group" "ERROR" "Failed to remove $($u.DisplayName) from $($g.DisplayName): $_"
             }
         }
     }
-    Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/drives/$($MgUserId)/permissions" -Body $Body
-    Write-Host -F Green "$($global:ADManager.DisplayName)" -NoNewline
-    Write-Host -F White " now has access to " -NoNewline
-    Write-Host -F Cyan "$($global:ADName)" -NoNewline
-    Write-Host -F White "'s OneDrive"
+
+    Add-Log "Remove Groups" "INFO" "Finished processing"
 }
-function Show-HideButtons {
-    param (
-        [bool]$show
-    )
-    $Button1.Visible = $show
-    $Button2.Visible = $show
-    $Button3.Visible = $show
-    $Button4.Visible = $show
-    $Button5.Visible = $show
-    $Button6.Visible = $show
-    $Button7.Visible = $show
-    $Button8.Visible = $show
-    $Button9.Visible = $show
-    $Button10.Visible = $show
-    $Button11.Visible = $show
-    $label1.Visible = $show
-    $label2.Visible = $show
-    $label3.Visible = $show
-    $label4.Visible = $show
-    $label5.Visible = $show
-    $label6.Visible = $show
-    $label7.Visible = $show
-    $label8.Visible = $show
-    $label9.Visible = $show
-    $label10.Visible = $show
-    $label11.Visible = $show
-}
-function enable-disableButtons {
-    param (
-        [bool]$enable
-    )
-    if ($global:AdUser) {
-        write-host $global:AdUser.Name
-        write-host $global:AdUser.DisplayName
-        write-host $global:AdUser.DistinguishedName
-        write-host $global:AdUser.Manager
-        if($global:AdUser.Enabled -ne $false){
-            write-host "Button 1 - $enable"
-            $Button1.Enabled = $enable
-            $label1.Enabled = $enable
-        } else {
-            write-host "Button 1 - Disabled"
-            $Button1.Enabled = $false
-            $label1.Enabled = $false
-        }
-        
-        if($global:AdUser.DisplayName.IndexOf("(Former Employee)") -eq -1){
-            write-host "Button 2 - $enable"
-            $Button2.Enabled = $enable
-            $label2.Enabled = $enable
-        } else {
-            write-host "Button 2 - Disabled"
-            $Button2.Enabled = $false
-            $label2.Enabled = $false
-        }
-        if($global:AdUser.MemberOf.Count -gt 0){
-            write-host "Button 3 - $enable"
-            $Button3.Enabled = $enable
-            $label3.Enabled = $enable
-        } else {
-            write-host "Button 3 - Disabled"
-            $Button3.Enabled = $false
-            $label3.Enabled = $false
-        }
-        if($global:ADManager -ne $null){
-            write-host "Button 4 - $enable"
-            $Button4.Enabled = $enable
-            $label4.Enabled = $enable
-        } else {
-            write-host "Button 4 - Disabled"
-            $Button4.Enabled = $false
-            $label4.Enabled = $false
-        }
-        if($global:AdUser.DistinguishedName.IndexOf("OU=Former Employees") -eq -1){
-            write-host "Button 5 - $enable"
-            $Button5.Enabled = $enable
-            $label5.Enabled = $enable
-        } else {
-            write-host "Button 5 - Disabled"
-            $Button5.Enabled = $false
-            $label5.Enabled = $false
-        }
 
-        $Button6.Enabled = $enable
-        $label6.Enabled = $enable
-        
-
-        if($global:MGGroups.Count -gt 0){
-            $Button7.Enabled = $enable
-            $label7.Enabled = $enable
-        } else {
-            write-host "Button 7 - Disabled"
-            $Button7.Enabled = $false
-            $label7.Enabled = $false
-        }
-
-        if($global:EXUser.RecipientTypeDetails -ne "SharedMailbox"){
-            $Button8.Enabled = $enable
-            $label8.Enabled = $enable
-        } else {
-            write-host "Button 8 - Disabled"
-            $Button8.Enabled = $false
-            $label8.Enabled = $false
-        }
-        
-
-        if($global:MGlicenses.Count -gt 0){
-            $Button9.Enabled = $enable
-            $label9.Enabled = $enable
-        } else {
-            write-host "Button 9 - Disabled"
-            $Button9.Enabled = $false
-            $label9.Enabled = $false
-        }
-        if($global:ADManager){
-            if($EXAlreadyDelegated -eq $false){
-                $Button10.Enabled = $enable
-                $label10.Enabled = $enable
-            } else {
-                write-host "Button 9 - Disabled"
-                $Button10.Enabled = $false
-                $label10.Enabled = $false
-            }
-        } else {
-            write-host "Button 9 - Disabled"
-            $Button10.Enabled = $false
-            $label10.Enabled = $false
-        }
-
-        if(1 -ne 1){
-            $Button11.Enabled = $enable
-            $label11.Enabled = $enable
-        } else {
-            $Button11.Enabled = $false
-            $label11.Enabled = $false
-        }
-    } else {
-        $Button1.Enabled = $enable
-        $Button2.Enabled = $enable
-        $Button3.Enabled = $enable
-        $Button4.Enabled = $enable
-        $Button5.Enabled = $enable
-        $Button6.Enabled = $enable
-        $Button7.Enabled = $enable
-        $Button8.Enabled = $enable
-        $Button9.Enabled = $enable
-        $Button10.Enabled = $enable
-        $Button11.Enabled = $enable
-        $label1.Enabled = $enable
-        $label2.Enabled = $enable
-        $label3.Enabled = $enable
-        $label4.Enabled = $enable
-        $label5.Enabled = $enable
-        $label6.Enabled = $enable
-        $label7.Enabled = $enable
-        $label8.Enabled = $enable
-        $label9.Enabled = $enable
-        $label10.Enabled = $enable
-        $label11.Enabled = $enable
+function Move-OU {
+    $u = $script:Context.ADUser
+    if ($u.DistinguishedName -notlike "*Former Employees*") {
+        Move-ADObject $u.DistinguishedName -TargetPath $FormerEmployeeOU
+        Add-Log "Move OU" "SUCCESS" ""
     }
 }
 
-# Create GUI Form
-$form = New-Object System.Windows.Forms.Form
-$form.Text = "Employee Off-boarding"
-$form.Size = New-Object System.Drawing.Size(500,600)
-$form.StartPosition = "CenterScreen"
-$form.FormBorderStyle = "FixedDialog"
-$form.MaximizeBox = $false
+function Revoke-Sessions {
+    $upn = $script:Context.ADUser.UserPrincipalName
+    Invoke-WithRetry { Revoke-MgUserSignInSession -UserId $upn }
+    Add-Log "Revoke Sessions" "SUCCESS" ""
+}
+
+function Remove-CloudGroups {
+    $ctx = $script:Context
+    $manualRemoval = @()  # groups that could not be removed automatically
+
+    foreach ($g in $ctx.MGGroups) {
+
+        # Skip on-prem synced groups
+        if ($g.AdditionalProperties.onPremisesSyncEnabled -eq $true) {
+            Add-Log "Skip Synced Group" "INFO" $g.AdditionalProperties.displayName
+            continue
+        }
+
+        $groupName = $g.AdditionalProperties.displayName
+        $upn = $ctx.MGUser.UserPrincipalName
+        $removed = $false
+
+        # ---------------------------
+        # 1. Try Microsoft Graph removal (Unified Groups / Cloud Security Groups)
+        # ---------------------------
+        if (-not $g.AdditionalProperties.mailEnabled -or $g.GroupTypes -contains "Unified") {
+            try {
+                Invoke-WithRetry {
+                    Remove-MgGroupMemberByRef -GroupId $g.Id -DirectoryObjectId $ctx.MGUser.Id
+                }
+                Add-Log "Remove Cloud Group" "SUCCESS" $groupName
+                $removed = $true
+            }
+            catch {
+                Add-Log "Remove Cloud Group" "WARNING" "Graph removal failed for $($ctx.MGUser.DisplayName) in $groupName : $_"
+            }
+        }
+
+        # ---------------------------
+        # 2. Try Exchange Online removal (Distribution / Mail-Enabled Security Groups)
+        # ---------------------------
+        if (-not $removed -and $g.AdditionalProperties.mailEnabled -eq $true) {
+            try {
+                # Use Remove-DistributionGroupMember for mail-enabled groups
+                Remove-DistributionGroupMember -Identity $groupName -Member $upn -Confirm:$false -ErrorAction Stop
+                Add-Log "Remove DG Member" "SUCCESS" $groupName
+                $removed = $true
+            }
+            catch {
+                Add-Log "Remove DG Member" "WARNING" "Exchange removal failed for $($ctx.MGUser.DisplayName) in $groupName : $_"
+            }
+        }
+
+        # ---------------------------
+        # 3. If still not removed, add to manual cleanup
+        # ---------------------------
+        if (-not $removed) {
+            $manualRemoval += $groupName
+        }
+    }
+
+    # ---------------------------
+    # Report manual cleanup required
+    # ---------------------------
+    if ($manualRemoval.Count -gt 0) {
+        Add-Log "Manual Cleanup Required" "WARNING" "User still in groups: $($manualRemoval -join ', ')"
+    } else {
+        Add-Log "Manual Cleanup Required" "SUCCESS" "User removed from all cloud groups successfully"
+    }
+}
+
+function Convert-Mailbox {
+
+    $upn = $script:Context.ADUser.UserPrincipalName
+
+    if (-not $script:Context.EXMailbox) {
+        Add-Log "Convert Mailbox" "WARNING" "No mailbox found"
+        return $false
+    }
+
+    try {
+
+        $mb = Get-Mailbox -Identity $upn -ErrorAction Stop
+
+        if ($mb.RecipientTypeDetails -eq "SharedMailbox") {
+            Add-Log "Convert Mailbox" "INFO" "Already a Shared Mailbox"
+            return $true
+        }
+
+        Set-Mailbox -Identity $upn -Type Shared -ErrorAction Stop
+
+        Start-Sleep 3
+
+        $verify = Get-Mailbox -Identity $upn
+
+        if ($verify.RecipientTypeDetails -eq "SharedMailbox") {
+            Add-Log "Convert Mailbox" "SUCCESS" "Converted to Shared Mailbox"
+            return $true
+        }
+        else {
+            Add-Log "Convert Mailbox" "ERROR" "Mailbox conversion did not complete"
+            return $false
+        }
+    }
+    catch {
+        Add-Log "Convert Mailbox" "ERROR" $_
+        return $false
+    }
+}
+
+function Remove-Licenses {
+
+    $ctx = $script:Context
+    $upn = $ctx.ADUser.UserPrincipalName
+
+    # Get current licenses
+    $user = Get-MgUser `
+        -UserId $upn `
+        -Property AssignedLicenses,LicenseAssignmentStates
+
+    if (-not $user.AssignedLicenses -or $user.AssignedLicenses.Count -eq 0) {
+        Add-Log "Remove Licenses" "INFO" "No licenses assigned"
+        return
+    }
+
+    # Only remove directly assigned licenses
+    $direct = @()
+
+    foreach ($state in $user.LicenseAssignmentStates) {
+        if (-not $state.AssignedByGroup) {
+            $direct += $state.SkuId
+        }
+    }
+
+    if ($direct.Count -eq 0) {
+        Add-Log "Remove Licenses" "INFO" "Only group-based licenses detected"
+        return
+    }
+
+    Add-Log "Remove Licenses" "INFO" "Removing $($direct.Count) license(s)"
+
+    # Build raw JSON payload
+    $payload = @{
+        addLicenses    = @()
+        removeLicenses = $direct
+    } | ConvertTo-Json -Depth 5
+
+    try {
+
+        Invoke-WithRetry {
+            Invoke-MgGraphRequest `
+                -Method POST `
+                -Uri "https://graph.microsoft.com/v1.0/users/$upn/assignLicense" `
+                -Body $payload `
+                -ContentType "application/json"
+        }
+
+        Start-Sleep 2
+
+        $verify = (Get-MgUser `
+            -UserId $upn `
+            -Property AssignedLicenses).AssignedLicenses
+
+        if ($verify.Count -lt $user.AssignedLicenses.Count) {
+            Add-Log "Remove Licenses" "SUCCESS" "Direct licenses removed"
+        }
+        else {
+            Add-Log "Remove Licenses" "WARNING" "License removal did not change state"
+        }
+
+    }
+    catch {
+        Add-Log "Remove Licenses" "ERROR" $_
+    }
+}
+
+function Delegate-Mailbox {
+    $ctx = $script:Context
+    if ($ctx.ADManager) {
+        Add-MailboxPermission `
+            -Identity $ctx.ADUser.UserPrincipalName `
+            -User $ctx.ADManager.UserPrincipalName `
+            -AccessRights FullAccess `
+            -AutoMapping $true
+        Add-Log "Delegate Mailbox" "SUCCESS" ""
+    }
+}
+
+function Run-All {
+    if (-not $script:Context.ADUser) { return }
+
+    $confirm = [Windows.Forms.MessageBox]::Show(
+        "Offboard $($script:Context.ADUser.DisplayName)?",
+        "Confirm",
+        "YesNo"
+    )
+
+    if ($confirm -ne "Yes") { return }
+
+    Disable-User
+    Rename-User
+    Remove-Groups
+    Move-OU
+
+    if ($script:Context.Connected) {
+        Revoke-Sessions
+        Remove-CloudGroups
+        Convert-Mailbox
+        Remove-Licenses
+        Delegate-Mailbox
+    }
+
+    Add-Log "OFFBOARDING COMPLETE" "SUCCESS" ""
+}
+
+# ==========================================
+# Export Report
+# ==========================================
+
+function Export-Report {
+    $path = "$env:USERPROFILE\Desktop\OffboardingReport.csv"
+    $script:Context.Log | Export-Csv $path -NoTypeInformation
+    Add-Log "Export Report" "SUCCESS" $path
+}
+
+# ==========================================
+# UI State Control
+# ==========================================
+
+function Refresh-UI {
+    $hasUser = $script:Context.ADUser -ne $null
+    $hasCloud = $script:Context.Connected
+
+    $ActionButtons | ForEach { $_.Enabled = $hasUser }
+    $CloudButtons  | ForEach { $_.Enabled = ($hasUser -and $hasCloud) }
+
+    $StatusLabel.Text =
+        if (-not $hasUser) {"No user loaded"}
+        elseif (-not $hasCloud) {"User loaded — Cloud not connected"}
+        else {"Ready"}
+}
+
+# ==========================================
+# AD Autocomplete Search
+# ==========================================
+
+function Search-AD {
+    param($text)
+
+    $UserList.Items.Clear()
+    if ([string]::IsNullOrWhiteSpace($text)) { return }
+
+    Get-ADUser -Filter "DisplayName -like '*$text*'" |
+        Select Name,SamAccountName |
+        ForEach {
+            $item = New-Object Windows.Forms.ListViewItem($_.Name)
+            $item.SubItems.Add($_.SamAccountName) | Out-Null
+            $UserList.Items.Add($item)
+        }
+
+    $UserList.Visible = $UserList.Items.Count -gt 0
+}
+
+# ==========================================
+# Setup AutoReply
+# ==========================================
+
+
+# ==========================================
+# UI Layout
+# ==========================================
+
+$form = New-Object Windows.Forms.Form
+$form.Text = "Employee Offboarding Console"
+$form.Size = "900,650"
 $form.Font = [System.Drawing.Font]::new("Segoe UI", 12)
-$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedSingle
+$form.StartPosition = "CenterScreen"
 
-# Add TextBox for employee username
-$textbox = New-Object System.Windows.Forms.TextBox
-$textbox.Location = New-Object System.Drawing.Point(10,40)
-$textbox.Size = New-Object System.Drawing.Size(200,24)
-$form.Controls.Add($textbox)
+$SearchBox = New-Object Windows.Forms.TextBox
+$SearchBox.Location = "20,20"
+$SearchBox.Width = 400
+$form.Controls.Add($SearchBox)
 
-# Add Off Board Button to trigger off-boarding process
-$Button = New-Object System.Windows.Forms.Button
-$Button.Location = New-Object System.Drawing.Point(10,80)
-$Button.Size = New-Object System.Drawing.Size(110,31)
-$Button.Text = "365 Login"
-$Button.Add_Click({
-    $Button.Enabled = $false
-    enable-disableButtons -enable $false
+$UserList = New-Object Windows.Forms.ListView
+$UserList.Location = "20,50"
+$UserList.Size = "300,150"
+$UserList.View = "Details"
+$UserList.Columns.Add("Name",200) | Out-Null
+$UserList.Columns.Add("Sam",0) | Out-Null
+$UserList.Visible = $false
+$form.Controls.Add($UserList)
 
-    # Start the background job to run the connection commands
-    $job = Start-Job -ScriptBlock {
-        write-host "Connecting MgGraph..." -nonewline
-        $MgGraph = Connect-MgGraph -NoWelcome
-        write-host -f green " Done"
+$SearchBox.Add_TextChanged({ Search-AD $SearchBox.Text })
 
-        write-host "Connecting Exchange$Online..." -nonewline
-        $ExchangeOnline = Connect-ExchangeOnline
-        write-host -f green " Done"
-    }
-
-    write-host "Job started, entering wait loop..."
-
-    # Wait loop for checking job completion
-    while ($true) {
-        $jobState = (Get-Job -Id $job.Id).State
-        [System.Windows.Forms.Application]::DoEvents()
-
-        if ($jobState -eq 'Completed') {
-            $Button.Text = "Connected"
-            $Button.Enabled = $false
-            write-host "Job completed!"
-            if ($global:ADUser) {
-                $global:MGUser = Get-MgUser -UserId $global:ADUser.UserPrincipalName -Property *
-                $global:MGGroups = Get-MgUserMemberOf -UserId $global:ADUser.UserPrincipalName | Select *
-                $global:MGlicenses = Get-MgUserLicenseDetail -UserId $global:ADUser.UserPrincipalName | Select *
-                $global:EXUser = Get-Mailbox -Filter "UserPrincipalName -eq '$($global:ADUser.UserPrincipalName)'" | Select *
-                $global:EXPrem = Get-MailboxPermission -Identity $global:ADUser.UserPrincipalName
-
-                enable-disableButtons -enable $true
-                Show-HideButtons -show $true
-            }
-            Receive-Job -Job $job
-            Remove-Job -Job $job
-            break  # Exit the loop
-        } elseif ($jobState -eq 'Failed') {
-            write-host "Job failed."
-            $Button.Text = "Login Failed"
-            $Button.Enabled = $true
-            enable-disableButtons -enable $false
-            Remove-Job -Job $job
-            break  # Exit the loop
-        } else {
-            $mod2 = [Math]::Round((Get-Date).ToFileTime() / 10000000) % 2
-            if($mod2 -eq 0) {
-                if ($Button.Text -eq "Please Wait"){
-                    $Button.Text = "Please Wait."
-                } elseif ($Button.Text -eq "Please Wait."){
-                    $Button.Text = "Please Wait.."
-                } elseif ($Button.Text -eq "Please Wait.."){
-                    $Button.Text = "Please Wait..."
-                } else{
-                    $Button.Text = "Please Wait"
-                }
-            }
-        }
-
-        Start-Sleep -Milliseconds  100  # Sleep for 1 second before checking again
-    }
-})
-$form.Controls.Add($Button)
-
-# 0. Show-Logs
-$Button0 = New-Object System.Windows.Forms.Button
-$Button0.Location = New-Object System.Drawing.Point(130,80)
-$Button0.Size = New-Object System.Drawing.Size(80, 31)
-$Button0.Text = "Logs"
-$Button0.Enabled = $false
-$Button0.Add_Click({
-})
-$form.Controls.Add($Button0)
-
-$tooltip = New-Object System.Windows.Forms.ToolTip
-# 1. Disable-AdAccount
-
-$label1 = New-Object System.Windows.Forms.Label
-$label1.Location = New-Object System.Drawing.Point(50, 120)
-$label1.Size = New-Object System.Drawing.Size(325, 24)
-$label1.Text = "Disable AD Account"
-# Add a tooltip to the button
-$tooltip.SetToolTip($label1, "Click for more info")
-$form.Controls.Add($label1)
-
-$Button1 = New-Object System.Windows.Forms.Button
-$Button1.Location = New-Object System.Drawing.Point(375, 120)
-$Button1.Size = New-Object System.Drawing.Size(95, 31)
-$Button1.Text = "Disable"
-$Button1.Add_Click({
-    Disable-AdAccount
-    $Button1.Enabled = $false
-})
-$form.Controls.Add($Button1)
-
-# 2. Update-DisplayName
-$label2 = New-Object System.Windows.Forms.Label
-$label2.Location = New-Object System.Drawing.Point(50, 160)
-$label2.Size = New-Object System.Drawing.Size(325, 24)
-$label2.Text = "Update Display Name with (Former Employee)"
-$form.Controls.Add($label2)
-
-$Button2 = New-Object System.Windows.Forms.Button
-$Button2.Location = New-Object System.Drawing.Point(375, 160)
-$Button2.Size = New-Object System.Drawing.Size(95, 31)
-$Button2.Text = "Update"
-$Button2.Add_Click({ 
-    Update-DisplayName
-    $Button2.Enabled = $false
-})
-$form.Controls.Add($Button2)
-
-# 3. Remove From Groups
-$label3 = New-Object System.Windows.Forms.Label
-$label3.Location = New-Object System.Drawing.Point(50, 200)
-$label3.Size = New-Object System.Drawing.Size(325, 24)
-$label3.Text = "Remove From Groups"
-$form.Controls.Add($label3)
-
-$Button3 = New-Object System.Windows.Forms.Button
-$Button3.Location = New-Object System.Drawing.Point(375, 200)
-$Button3.Size = New-Object System.Drawing.Size(95, 31)
-$Button3.Text = "Remove"
-$Button3.Add_Click({ 
-    Remove-FromSecurityGroups
-    $Button3.Enabled = $false
-})
-$form.Controls.Add($Button3)
-
-# 4. Clear Manager
-$label4 = New-Object System.Windows.Forms.Label
-$label4.Location = New-Object System.Drawing.Point(50, 240)
-$label4.Size = New-Object System.Drawing.Size(325, 24)
-$label4.Text = "Clear Manager"
-$form.Controls.Add($label4)
-
-$Button4 = New-Object System.Windows.Forms.Button
-$Button4.Location = New-Object System.Drawing.Point(375, 240)
-$Button4.Size = New-Object System.Drawing.Size(95, 31)
-$Button4.Text = "Clear"
-$Button4.Add_Click({ 
-    Clear-Manager
-    $Button4.Enabled = $false
-})
-$form.Controls.Add($Button4)
-
-# 5. Move To Former Employees OU
-$label5 = New-Object System.Windows.Forms.Label
-$label5.Location = New-Object System.Drawing.Point(50, 280)
-$label5.Size = New-Object System.Drawing.Size(325, 24)
-$label5.Text = "Move to Former Employees OU"
-$form.Controls.Add($label5)
-
-$Button5 = New-Object System.Windows.Forms.Button
-$Button5.Location = New-Object System.Drawing.Point(375, 280)
-$Button5.Size = New-Object System.Drawing.Size(95, 31)
-$Button5.Text = "Move"
-$Button5.Add_Click({ 
-    Move-AdUserToOU
-    $Button5.Enabled = $false
-})
-$form.Controls.Add($Button5)
-
-# 6. Revoke Office 365 Sessions
-$label6 = New-Object System.Windows.Forms.Label
-$label6.Location = New-Object System.Drawing.Point(50, 320)
-$label6.Size = New-Object System.Drawing.Size(325, 24)
-$label6.Text = "Revoke Office 365 Sessions"
-$form.Controls.Add($label6)
-
-$Button6 = New-Object System.Windows.Forms.Button
-$Button6.Location = New-Object System.Drawing.Point(375, 320)
-$Button6.Size = New-Object System.Drawing.Size(95, 31)
-$Button6.Text = "Revoke"
-$Button6.Add_Click({ 
-    Revoke-Office365Sessions
-    $Button6.Enabled = $false
-})
-$form.Controls.Add($Button6)
-
-# 7. Remove from Exchange Groups
-$label7 = New-Object System.Windows.Forms.Label
-$label7.Location = New-Object System.Drawing.Point(50, 360)
-$label7.Size = New-Object System.Drawing.Size(325, 24)
-$label7.Text = "Remove from Exchange Groups"
-$form.Controls.Add($label7)
-
-$Button7 = New-Object System.Windows.Forms.Button
-$Button7.Location = New-Object System.Drawing.Point(375, 360)
-$Button7.Size = New-Object System.Drawing.Size(95, 31)
-$Button7.Text = "Remove"
-$Button7.Add_Click({ 
-    Remove-FromExchangeGroups
-    $Button7.Enabled = $false
-})
-$form.Controls.Add($Button7)
-
-# 8. Convert to Shared Mailbox
-$label8 = New-Object System.Windows.Forms.Label
-$label8.Location = New-Object System.Drawing.Point(50, 400)
-$label8.Size = New-Object System.Drawing.Size(325, 24)
-$label8.Text = "Convert to Shared Mailbox"
-$form.Controls.Add($label8)
-
-$Button8 = New-Object System.Windows.Forms.Button
-$Button8.Location = New-Object System.Drawing.Point(375, 400)
-$Button8.Size = New-Object System.Drawing.Size(95, 31)
-$Button8.Text = "Convert"
-$Button8.Add_Click({ 
-    Convert-MailboxToShared
-    $Button8.Enabled = $false
-})
-$form.Controls.Add($Button8)
-
-# 9. Remove Microsoft Licenses
-$label9 = New-Object System.Windows.Forms.Label
-$label9.Location = New-Object System.Drawing.Point(50, 440)
-$label9.Size = New-Object System.Drawing.Size(325, 24)
-$label9.Text = "Remove Microsoft Licenses"
-$form.Controls.Add($label9)
-
-$Button9 = New-Object System.Windows.Forms.Button
-$Button9.Location = New-Object System.Drawing.Point(375, 440)
-$Button9.Size = New-Object System.Drawing.Size(95, 31)
-$Button9.Text = "Remove"
-$Button9.Add_Click({ 
-    Remove-MicrosoftLicenses
-    $Button9.Enabled = $false
-})
-$form.Controls.Add($Button9)
-
-# 10. Delegate Mailbox Access
-$label10 = New-Object System.Windows.Forms.Label
-$label10.Location = New-Object System.Drawing.Point(50, 480)
-$label10.Size = New-Object System.Drawing.Size(325, 24)
-$label10.Text = "Delegate Mailbox Access"
-$form.Controls.Add($label10)
-
-$Button10 = New-Object System.Windows.Forms.Button
-$Button10.Location = New-Object System.Drawing.Point(375, 480)
-$Button10.Size = New-Object System.Drawing.Size(95, 31)
-$Button10.Text = "Delegate"
-$Button10.Add_Click({ 
-    Delegate-MailboxAccess 
-    $Button10.Enabled = $false
-})
-$form.Controls.Add($Button10)
-
-# 11. Grant OneDrive Access
-$label11 = New-Object System.Windows.Forms.Label
-$label11.Location = New-Object System.Drawing.Point(50, 520)
-$label11.Size = New-Object System.Drawing.Size(325, 24)
-$label11.Text = "Grant OneDrive Access"
-$form.Controls.Add($label11)
-
-$Button11 = New-Object System.Windows.Forms.Button
-$Button11.Location = New-Object System.Drawing.Point(375, 520)
-$Button11.Size = New-Object System.Drawing.Size(95, 31)
-$Button11.Text = "Soon..."
-$Button11.Add_Click({ 
-    Grant-OneDriveAccess
-    $Button11.Enabled = $false
-})
-$form.Controls.Add($Button11)
-
-# Add ListView to display AD users
-$listView = New-Object System.Windows.Forms.ListView
-$listView.Location = New-Object System.Drawing.Point(220, 40)
-$listView.Size = New-Object System.Drawing.Size(250, 0)
-$listView.Visible = $false
-$listView.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor`
-[System.Windows.Forms.AnchorStyles]::Right -bor`
-[System.Windows.Forms.AnchorStyles]::Bottom -bor`
-[System.Windows.Forms.AnchorStyles]::Left
-$listView.View = [System.Windows.Forms.View]::Details
-$listView.FullRowSelect = $true
-$form.Controls.Add($listView)
-
-# Add columns to the ListView
-$listView.Columns.Add("Display Name", 170) | Out-Null
-$listView.Columns.Add("SamAccount Name", 0) | Out-Null
-# $listView.Columns[1].Width = 0  # Set the width of the SamAccount Name column to 0 to hide it
-
-$ADSam =  "cameronm"
-$displayName = ""
-$ADName = ""
-$ADUser = $null
-$ADManager = $null
-$MGUser = $null
-$MGGroups = $null
-$MGlicenses = $null
-$EXUser = $null
-$EXPrem = $null
-$EXAlreadyDelegated = $false
-
-# ListView DoubleClick event handler
-$listView.add_DoubleClick({
-    # Get the selected item from the list
-    $selectedItem = $listView.SelectedItems[0]
-    $global:displayName = $selectedItem.Text
-    $global:ADSam = $selectedItem.SubItems[1].Text
-    $textbox.Text = $ADSam
-    $listView.Visible = $false
-    
-    $global:ADUser = Get-ADUser -Filter { SamAccountName -eq $ADSam } -Properties *
-    $global:ADName = $global:ADUser.Name
-    
-    if ($global:ADUser.Manager) {
-        $global:ADManager = Get-ADUser -Filter { DistinguishedName -eq $ADUser.Manager } -Properties *
-        write-host "Manager's Name: " $global:ADManager.DisplayName
-        $EXAlreadyDelegated = ($global:EXPrem | Where-Object { $_.AccessRights -eq "FullAccess" }).User -contains $global:ADManager.UserPrincipalName
-    } else {
-        $global:ADManager = $null
-        write-host "No manager found for the user."
-    }
-    If($Button.Text -eq "Connected"){
-        
-        if ($global:ADUser) {
-            $global:MGUser = Get-MgUser -UserId $global:ADUser.UserPrincipalName -Property *
-
-            $global:MGGroups = Get-MgUserMemberOf -UserId $global:ADUser.UserPrincipalName | Select *
-            $global:MGlicenses = Get-MgUserLicenseDetail -UserId $global:ADUser.UserPrincipalName | Select *
-            $global:EXUser = Get-Mailbox -Filter "UserPrincipalName -eq '$($global:ADUser.UserPrincipalName)'" | Select *
-            $global:EXPrem = Get-MailboxPermission -Identity $global:ADUser.UserPrincipalName
-
-            # Show buttons after selecting the user
-            enable-disableButtons -enable $true
-        }
-    } else {
-        enable-disableButtons -enable $false
-    }
-    Show-HideButtons -show $true
+$UserList.Add_DoubleClick({
+    $sam = $UserList.SelectedItems[0].SubItems[1].Text
+    Load-User $sam
+    $UserList.Visible = $false
 })
 
-# Function to retrieve AD users based on filter
-function Get-ADUsers {
-    param (
-        [string]$filter
-    )
-    $searcher = Get-ADUser -Filter "DisplayName -like '*$filter*'"
-    $listView.Items.Clear()
-    $searcher | ForEach-Object {
-        $item = New-Object System.Windows.Forms.ListViewItem($_.Name)
-        $item.SubItems.Add($_.SamAccountName) | Out-Null
-        $listView.Items.Add($item)
-    }
-}
+$ConnectBtn = New-Object Windows.Forms.Button
+$ConnectBtn.Text = "Connect to M365"
+$ConnectBtn.Location = "440,20"
+$ConnectBtn.Size = New-Object System.Drawing.Size(200,30)
+$ConnectBtn.Add_Click({ Connect-Cloud })
+$form.Controls.Add($ConnectBtn)
 
-# TextBox TextChanged event handler
-$textbox.add_TextChanged({
-    $filter = $textbox.Text
-    if (-not [string]::IsNullOrEmpty($filter)) {
-    
-        Show-HideButtons -show $false
-        $listView.Visible = $true
-        $global:AdUsers = Get-ADUsers -filter $filter
-        $listView.Height = [math]::Max(70,[math]::Min($form.Height - ($listView.Top * 3),32+($listView.Items.count * 25)))
-    } else {
-        $listView.Items.Clear()
-        $listView.Visible = $false
-        Show-HideButtons -show $false
-    }
-})
+$CheckMailGroupsBtn = New-Object Windows.Forms.Button
+$CheckMailGroupsBtn.Text = "Check M365 Groups"
+$CheckMailGroupsBtn.Location = "660,20"
+$CheckMailGroupsBtn.Size = New-Object System.Drawing.Size(200,30)
+$CheckMailGroupsBtn.Add_Click({ check-mailgroups })
+$CheckMailGroupsBtn.Enabled = $false
+$form.Controls.Add($CheckMailGroupsBtn)
 
-$form.Add_Shown({Get-ADUsers -filter "a"})
-Show-HideButtons -show $true
-enable-disableButtons -enable $true
+$RunAllBtn = New-Object Windows.Forms.Button
+$RunAllBtn.Text = "Run Offboarding"
+$RunAllBtn.Location = "440,60"
+$RunAllBtn.Size = New-Object System.Drawing.Size(200,30)
+$RunAllBtn.Add_Click({ Run-All })
+$RunAllBtn.Enabled = $false
+$form.Controls.Add($RunAllBtn)
 
-# Display Form
+$AutoReplyBtn = New-Object System.Windows.Forms.Button
+$AutoReplyBtn.Text = "Setup Auto Reply"
+$AutoReplyBtn.Location = "660,60"
+$AutoReplyBtn.Size = New-Object System.Drawing.Size(200,30)
+$AutoReplyBtn.Add_Click({ Setup-AutoReply })
+$AutoReplyBtn.Enabled = $false
+$form.Controls.Add($AutoReplyBtn)
+
+$ExportBtn = New-Object Windows.Forms.Button
+$ExportBtn.Text = "Export Report"
+$ExportBtn.Location = "440,100"
+$ExportBtn.Size = New-Object System.Drawing.Size(200,30)
+$ExportBtn.Add_Click({ Export-Report })
+$ExportBtn.Enabled = $false
+$form.Controls.Add($ExportBtn)
+
+$btnVerify = New-Object System.Windows.Forms.Button
+$btnVerify.Text = "Verify Former OU"
+$btnVerify.Location = "440,140"
+$btnVerify.Size = New-Object System.Drawing.Size(200,30)
+$btnVerify.Add_Click({Verify-FormerOU})
+$btnVerify.Enabled = $false
+$form.Controls.Add($btnVerify)
+
+$StatusLabel = New-Object Windows.Forms.Label
+$StatusLabel.Location = "440,180"
+$StatusLabel.Width = 400
+$form.Controls.Add($StatusLabel)
+
+$LogBox = New-Object System.Windows.Forms.RichTextBox
+$LogBox.Multiline = $true
+$LogBox.ReadOnly = $true
+$LogBox.Location = "20,220"
+$LogBox.Size = "840,360"
+$LogBox.BackColor = [System.Drawing.Color]::FromArgb(30,30,30)
+$LogBox.ForeColor = "White"
+$LogBox.Font = New-Object System.Drawing.Font("Consolas", 10)
+$form.Controls.Add($LogBox)
+
+$ActionButtons = @($RunAllBtn)
+$CloudButtons = @()
+
+Refresh-UI
+
 $form.ShowDialog()
